@@ -26,6 +26,7 @@ pub struct ApplyMsg {
 pub struct State {
     pub term: u64,
     pub is_leader: bool,
+    pub voted_for : u64,
 }
 
 impl State {
@@ -36,6 +37,14 @@ impl State {
     /// Whether this peer believes it is the leader.
     pub fn is_leader(&self) -> bool {
         self.is_leader
+    }
+    /// Who is this node voting for
+    /// protocal : since it's encode, using Optional is not ideal
+    /// since encoder couldn't a naive way to store them
+    /// So we use 0 present None,
+    /// use x + 1 present x
+    pub fn voted_for(&self) -> u64 {
+        self.voted_for
     }
 }
 
@@ -255,8 +264,9 @@ impl Node {
     /// The current state of this peer.
     pub fn get_state(&self) -> State {
         State {
-            term: self.term(),
-            is_leader: self.is_leader(),
+            term: self.raft.state.term(),
+            is_leader: self.raft.state.is_leader(),
+            voted_for: self.rate.state.voted_for(),
         }
     }
 

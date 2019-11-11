@@ -2,6 +2,8 @@
 extern crate prost_derive;
 
 use futures::Future;
+
+// an inner use toy model rpc service
 use labrpc::*;
 
 /// A Hand-written protobuf messages
@@ -10,6 +12,11 @@ pub struct Echo {
     #[prost(int64, tag = "1")]
     pub x: i64,
 }
+
+// automatically creating a service model
+// with Trait Client, Service, 
+// and a pub fn add_service
+// remember to use use::your_crate
 
 service! {
     service echo {
