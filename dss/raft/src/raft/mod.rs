@@ -140,6 +140,7 @@ impl Raft {
     /// is no need to implement your own timeouts around this method.
     ///
     /// look at the comments in ../labrpc/src/lib.rs for more details.
+    /// query part
     fn send_request_vote(
         &self,
         server: usize,
@@ -160,8 +161,18 @@ impl Raft {
         // );
         // rx
         // ```
-        let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
-        crate::your_code_here((server, args, tx, rx))
+        //et (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
+        let peer = &self.peers[server];
+        let (tx, rx) = channel();
+        peer.spawn(
+            peer.request_vote(&args)
+                .map_err(Error::Rpc)
+                .then(move |res| {
+                    tx.send(res);
+                    Ok(())
+                }),
+        );
+        rx
     }
 
     fn start<M>(&self, command: &M) -> Result<(u64, u64)>
@@ -223,6 +234,12 @@ impl Node {
         crate::your_code_here(raft)
     }
 
+    /// Common part of all servers, no matter which state it is in
+    /// It has strong side effect, it will change status of self
+    pub fn common_react() {
+        let _=1;
+    }
+
     /// the service using Raft (e.g. a k/v server) wants to start
     /// agreement on the next command to be appended to Raft's log. if this
     /// server isn't the leader, returns [`Error::NotLeader`]. otherwise start
@@ -247,18 +264,12 @@ impl Node {
 
     /// The current term of this peer.
     pub fn term(&self) -> u64 {
-        // Your code here.
-        // Example:
-        // self.raft.term
-        crate::your_code_here(())
+        self.raft.state.term
     }
 
     /// Whether this peer believes it is the leader.
     pub fn is_leader(&self) -> bool {
-        // Your code here.
-        // Example:
-        // self.raft.leader_id == self.id
-        crate::your_code_here(())
+        self.raft.state.is_learer()
     }
 
     /// The current state of this peer.
@@ -287,8 +298,31 @@ impl RaftService for Node {
     // example RequestVote RPC handler.
     //
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
+    // response part
     fn request_vote(&self, args: RequestVoteArgs) -> RpcFuture<RequestVoteReply> {
         // Your code here (2A, 2B).
-        crate::your_code_here(args)
+        // 2A
+        self.common_react();
+
+        let vote_reply = if RequestVoteArgs.term < self.term(){
+                            RequestVoteReply{term:self.term(),vote_granted:false}
+                        }else{
+                            RequestVoteReply{term:RequestVoteArgs.term,vote_granted:true}
+                        };
+        Box::new(futures::future::result(Ok(vote_reply)))
+    }
+
+    fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
+        // Your code here (2A, 2B).
+        // 2A
+
+        self.common_react();  //side effect!
+
+        let append_reply =  if AppendEntriesArgs.term < self.term(){
+                                AppendEntriesReply{term:self.term(), success : false};
+                            } else{
+                                AppendEntriesReply{term:AppendEntriesArgs.term, success : true}
+                            };
+        Box::new(futures::future::result(Ok(append_reply)))
     }
 }
