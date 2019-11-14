@@ -1,8 +1,10 @@
-use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::mpsc::{sync_channel,Sneder, Receiver, RecvError};
 use std::sync::Arc;
 
 use futures::sync::mpsc::UnboundedSender;
 use labrpc::RpcFuture;
+
+use random_integer;
 
 #[cfg(test)]
 pub mod config;
@@ -14,6 +16,10 @@ mod tests;
 use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
+
+use std::time::Duration;
+use futures_timer::Delay;
+use futures::prelude::*;
 
 pub struct ApplyMsg {
     pub command_valid: bool,
@@ -208,6 +214,17 @@ impl Raft {
     }
 }
 
+
+#[detive(Clone,Debug)]
+enum NodeStatus{
+    LEADER,
+    FOLLOWER,
+    CANDIDATE,
+}
+
+type Rx = Arc<Mutex<mpsc::Receiver<NodeStatus>>>;
+type Tx = Arc<Mutex<mpsc::Sender<NodeStatus>>>;
+
 // Choose concurrency paradigm.
 //
 // You can either drive the raft state machine by the rpc framework,
@@ -225,7 +242,12 @@ impl Raft {
 #[derive(Clone)]
 pub struct Node {
     // Your code here.
+    raft: Arc<Mutex<Raft>>,
+    receiver : Rx,
+    sender : Tx,
+
 }
+
 
 impl Node {
     /// Create a new raft service.
@@ -234,9 +256,39 @@ impl Node {
         crate::your_code_here(raft)
     }
 
+    /// a dispatcher
+    #[inline]
+    fn tick(msg : NodeStatus) -> (){
+        match msg {
+            NodeStatus::FOLLOWER => {become_follower();}
+            _ => unimplemented!();
+        }
+    }
+
+    fn become_follower(&self){
+        let election_rand = random_integer::random_u8(100,450);
+        let duration = Duration::from_millis(election_rand);
+        let trigger_election = Delay::new(duration).map(|()|{
+            if self.voted_for() == 0 {return;}
+            let sender = self.sender.lock().unwrap().recv().unwrap();
+            sender.send(()); // terminate, async
+            tick(NodeStatus::CANDIDATE); //issue a new candidate status
+        });
+        loop{
+            let rx = self.receiver.lock().unwrap().recv().unwrap();
+            match rx.try_recv() {
+                    Ok(_)  | Err(TryRecvError::Disconnected)=> {
+                        // terminate, normal exiting
+                        break;
+                    },
+                    Err(TryRecvError::Empty) => {}
+                }
+        }
+    } 
+
     /// Common part of all servers, no matter which state it is in
     /// It has strong side effect, it will change status of self
-    pub fn common_react() {
+    fn common_react() {
         let _=1;
     }
 
@@ -264,12 +316,16 @@ impl Node {
 
     /// The current term of this peer.
     pub fn term(&self) -> u64 {
-        self.raft.state.term
+        self.raft.state.term()
     }
 
     /// Whether this peer believes it is the leader.
     pub fn is_leader(&self) -> bool {
         self.raft.state.is_learer()
+    }
+
+    pub fn voted_for(&self) -> u64 {
+        self.raft.state.voted_for()
     }
 
     /// The current state of this peer.
