@@ -266,6 +266,11 @@ impl Node {
     }
 
     fn become_follower(&self){
+        // need to update the status of node!
+        let new_state = Arc::new(State{term:self.term(),is_leader:false,voted_for:self.voted_for()});
+        let mut raft_ptr = self.raft.lock().unwrap();
+        (*raft_ptr).state = new_state;
+
         let election_rand = random_integer::random_u8(100,450);
         let duration = Duration::from_millis(election_rand);
         let trigger_election = Delay::new(duration).map(|()|{
@@ -273,11 +278,6 @@ impl Node {
             let sender = self.sender.lock().unwrap().recv().unwrap();
 
             sender.send(()); // terminate, async
-            
-            // need to update the status of node!
-            let new_state = Arc::new(State{term:self.term(),is_leader:false,voted_for:self.voted_for()});
-            let mut raft_ptr = self.raft.lock().unwrap();
-            (*raft_ptr).state = new_state;
 
             tick(NodeStatus::CANDIDATE); //issue a new candidate status
         });
