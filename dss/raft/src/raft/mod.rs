@@ -271,7 +271,14 @@ impl Node {
         let trigger_election = Delay::new(duration).map(|()|{
             if self.voted_for() == 0 {return;}
             let sender = self.sender.lock().unwrap().recv().unwrap();
+
             sender.send(()); // terminate, async
+            
+            // need to update the status of node!
+            let new_state = Arc::new(State{term:self.term(),is_leader:false,voted_for:self.voted_for()});
+            let mut raft_ptr = self.raft.lock().unwrap();
+            (*raft_ptr).state = new_state;
+
             tick(NodeStatus::CANDIDATE); //issue a new candidate status
         });
         loop{
