@@ -23,6 +23,7 @@ log = "0.4"
 futures = "0.1"
 futures-timer = "0.1"
 random-integer = "1.0.5"
+tokio = "0.1.22"
 
 [dev-dependencies]
 env_logger = "0.6"

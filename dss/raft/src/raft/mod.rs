@@ -1,7 +1,7 @@
-use std::sync::mpsc::{sync_channel,Sneder, Receiver, RecvError};
-use std::sync::Arc;
+//use std::sync::mpsc::{Sender, Receiver,channel};
+use std::sync::{Arc,Mutex};
 
-use futures::sync::mpsc::UnboundedSender;
+use futures::sync::mpsc::{UnboundedSender, channel, Sender, Receiver};
 use labrpc::RpcFuture;
 
 use random_integer;
@@ -17,9 +17,10 @@ use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use futures_timer::Delay;
 use futures::prelude::*;
+use std::thread;
 
 pub struct ApplyMsg {
     pub command_valid: bool,
@@ -51,6 +52,14 @@ impl State {
     /// use x + 1 present x
     pub fn voted_for(&self) -> u64 {
         self.voted_for
+    }
+
+    pub fn new() -> Self {
+        State{
+            term : 0,
+            is_leader : false,
+            voted_for : 0,
+        }
     }
 }
 
@@ -167,11 +176,40 @@ impl Raft {
         // );
         // rx
         // ```
-        //et (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
+        // let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
         let peer = &self.peers[server];
-        let (tx, rx) = channel();
+        let peer_limit = self.peers.len();
+        let (tx, rx) : (Sender<Result<RequestVoteReply>>,Receiver<Result<RequestVoteReply>>) = channel(2 * peer_limit);
         peer.spawn(
-            peer.request_vote(&args)
+            peer.request_vote(args)
+                .map_err(Error::Rpc)
+                .then(move |res| {
+                    tx.send(res);
+                    Ok(())
+                }),
+        );
+        rx
+    }
+    // function then
+    /*
+    Chain on a computation for when a future finished, passing the 
+    result of the future to the provided closure f.
+    The returned value of the closure must implement the Future trait and can 
+    represent some more work to be done before the composed future is finished.
+    The closure f is only run after successful completion of the self future.
+    Note that this function consumes the receiving future and returns a wrapped version of it.
+    */
+
+    fn send_apply_entry(
+        &self,
+        server: usize,
+        args: &AppendEntriesArgs,
+    ) -> Receiver<Result<AppendEntriesReply>> {
+        let peer = &self.peers[server];
+        let peer_limit = self.peers.len();
+        let (tx, rx): (Sender<Result<AppendEntriesReply>>, Receiver<Result<AppendEntriesReply>>) = channel(2 * peer_limit);
+        peer.spawn(
+            peer.append_entries(args)
                 .map_err(Error::Rpc)
                 .then(move |res| {
                     tx.send(res);
@@ -215,15 +253,12 @@ impl Raft {
 }
 
 
-#[detive(Clone,Debug)]
+#[derive(Clone,Debug)]
 enum NodeStatus{
     LEADER,
     FOLLOWER,
     CANDIDATE,
 }
-
-type Rx = Arc<Mutex<mpsc::Receiver<NodeStatus>>>;
-type Tx = Arc<Mutex<mpsc::Sender<NodeStatus>>>;
 
 // Choose concurrency paradigm.
 //
@@ -243,11 +278,23 @@ type Tx = Arc<Mutex<mpsc::Sender<NodeStatus>>>;
 pub struct Node {
     // Your code here.
     raft: Arc<Mutex<Raft>>,
-    receiver : Rx,
-    sender : Tx,
-
+    status : Arc<Mutex<NodeStatus>>,
 }
 
+const SNAPTIME : u64 = 2;
+macro_rules! event_loop {
+    ($duration : expr , $b : block) => {
+        let before = Instant::now();
+        loop{
+            let esclapsed = Instant::now() - before;
+            if esclapsed > $duration {break;}
+            // payload
+            $b;
+            // reduce the frequency
+            thread::sleep(Duration::from_millis(SNAPTIME));
+        }
+    };
+}
 
 impl Node {
     /// Create a new raft service.
@@ -257,45 +304,91 @@ impl Node {
     }
 
     /// a dispatcher
+    /// tick and following become_* function should return immediately
     #[inline]
-    fn tick(msg : NodeStatus) -> (){
-        match msg {
-            NodeStatus::FOLLOWER => {become_follower();}
-            _ => unimplemented!();
+    fn tick(&self,transmission : NodeStatus) {
+        match transmission {
+            NodeStatus::CANDIDATE => self.become_candidate(),
+            NodeStatus::LEADER => self.become_leader(),
+            NodeStatus::FOLLOWER => self.become_follower(),
         }
     }
 
+    #[inline]
+    fn random_duration_generator(lower : usize, upper : usize) -> Duration {
+        let rand = random_integer::random_u64(lower as u64, upper as u64);
+        Duration::from_millis(rand)
+    }
+
+    // blocking there
     fn become_follower(&self){
         // need to update the status of node!
         let new_state = Arc::new(State{term:self.term(),is_leader:false,voted_for:self.voted_for()});
         let mut raft_ptr = self.raft.lock().unwrap();
         (*raft_ptr).state = new_state;
 
-        let election_rand = random_integer::random_u8(100,450);
-        let duration = Duration::from_millis(election_rand);
-        let trigger_election = Delay::new(duration).map(|()|{
-            if self.voted_for() == 0 {return;}
-            let sender = self.sender.lock().unwrap().recv().unwrap();
-
-            sender.send(()); // terminate, async
-
-            tick(NodeStatus::CANDIDATE); //issue a new candidate status
+        // callback, in another thread
+        let _trigger_election = Delay::new(Self::random_duration_generator(100, 450)).map(|_|{
+            self.tick(NodeStatus::CANDIDATE); //issue a new candidate status
         });
-        loop{
-            let rx = self.receiver.lock().unwrap().recv().unwrap();
-            match rx.try_recv() {
-                    Ok(_)  | Err(TryRecvError::Disconnected)=> {
-                        // terminate, normal exiting
-                        break;
-                    },
-                    Err(TryRecvError::Empty) => {}
-                }
-        }
     } 
+
+    fn become_candidate(&self)  {
+        let mut raft_ptr = self.raft.lock().unwrap();
+        // need to update the status of node!
+        let myself_id = (*raft_ptr).me;
+        let new_state = Arc::new(State{term:self.term() + 1,is_leader:false,voted_for:myself_id as u64});
+        // update the state
+        (*raft_ptr).state = new_state;
+        // get the peer number, will be used later
+        let peer_number = (*raft_ptr).peers.len();
+        //  change interal status
+        *(self.status.lock().unwrap()) = NodeStatus::CANDIDATE;
+        let dur = Self::random_duration_generator(100, 450);
+        // reset election timer
+        let _trigger_election = Delay::new(dur).map(|_|{
+            self.tick(NodeStatus::CANDIDATE); //issue a new candidate status
+        });
+        // async issue vote request
+        let mut receivers_pool : Vec<Receiver<Result<RequestVoteReply>>> = 
+                             Vec::with_capacity(peer_number);
+        for index in 0..peer_number {
+            if index != myself_id {
+                let server = index as usize;
+                let request_arg = RequestVoteArgs{
+                    term : self.term(),
+                    candidate_id : self.voted_for(),
+                };
+                receivers_pool.push((*raft_ptr).send_request_vote(server,&request_arg));
+            }
+        }
+        // a counter to count how many votes itself gets
+        let mut counter = 1;  // first we have the vote from ourselves.
+        event_loop!(dur, {
+            for rx in &mut receivers_pool {
+                // rx is the recevier of a future, poll is TRY TO fetch data
+                // from stream, it is never blocked.
+                if let Ok(Async::Ready(Some(Ok(vote_reply)))) = rx.poll(){
+                    if vote_reply.term == self.term() && vote_reply.vote_granted == true {
+                        counter += 1;
+                    }
+                }
+            }
+            if counter >= (peer_number + 1)/2 {break;}
+        });
+        if counter >= (peer_number + 1) / 2 {
+            self.tick(NodeStatus::LEADER);
+        }
+        // otherwise just normally exit, because this time it must be another thread issueing new candidate
+    }
+
+    fn become_leader(&self) {
+        let  _ = 1;
+    }
 
     /// Common part of all servers, no matter which state it is in
     /// It has strong side effect, it will change status of self
-    fn common_react() {
+    fn common_react(&self) {
         let _=1;
     }
 
@@ -323,25 +416,16 @@ impl Node {
 
     /// The current term of this peer.
     pub fn term(&self) -> u64 {
-        self.raft.state.term()
+        self.raft.lock().unwrap().state.term()
     }
 
     /// Whether this peer believes it is the leader.
     pub fn is_leader(&self) -> bool {
-        self.raft.state.is_learer()
+        self.raft.lock().unwrap().state.is_leader()
     }
 
     pub fn voted_for(&self) -> u64 {
-        self.raft.state.voted_for()
-    }
-
-    /// The current state of this peer.
-    pub fn get_state(&self) -> State {
-        State {
-            term: self.raft.state.term(),
-            is_leader: self.raft.state.is_leader(),
-            voted_for: self.rate.state.voted_for(),
-        }
+        self.raft.lock().unwrap().state.voted_for()
     }
 
     /// the tester calls kill() when a Raft instance won't be
@@ -367,10 +451,10 @@ impl RaftService for Node {
         // 2A
         self.common_react();
 
-        let vote_reply = if RequestVoteArgs.term < self.term(){
+        let vote_reply = if args.term < self.term(){
                             RequestVoteReply{term:self.term(),vote_granted:false}
                         }else{
-                            RequestVoteReply{term:RequestVoteArgs.term,vote_granted:true}
+                            RequestVoteReply{term:args.term,vote_granted:true}
                         };
         Box::new(futures::future::result(Ok(vote_reply)))
     }
@@ -381,10 +465,10 @@ impl RaftService for Node {
 
         self.common_react();  //side effect!
 
-        let append_reply =  if AppendEntriesArgs.term < self.term(){
-                                AppendEntriesReply{term:self.term(), success : false};
+        let append_reply =  if args.term < self.term(){
+                                AppendEntriesReply{term:self.term(), success : false}
                             } else{
-                                AppendEntriesReply{term:AppendEntriesArgs.term, success : true}
+                                AppendEntriesReply{term:args.term, success : true}
                             };
         Box::new(futures::future::result(Ok(append_reply)))
     }
