@@ -1,5 +1,7 @@
 //use std::sync::mpsc::{Sender, Receiver,channel};
-use std::sync::{Arc,Mutex, atomic::AtomicBool,atomic::Ordering};
+use std::sync::{Arc,Mutex, atomic::{AtomicBool,Ordering,AtomicI32}};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use futures::sync::mpsc::{UnboundedSender, channel, Sender, Receiver};
 use labrpc::RpcFuture;
@@ -17,10 +19,9 @@ use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
 
-use std::time::{Duration, Instant};
+
 use futures_timer::Delay;
 use futures::prelude::*;
-use std::thread;
 
 pub struct ApplyMsg {
     pub command_valid: bool,
@@ -249,6 +250,7 @@ enum NodeStatus{
     LEADER,
     FOLLOWER,
     CANDIDATE,
+    SUICIDE,
 }
 
 // Choose concurrency paradigm.
@@ -267,9 +269,11 @@ enum NodeStatus{
 // ```
 #[derive(Clone)]
 pub struct Node {
-    raft: Arc<Mutex<Raft>>,                  // raft state machine
-    node_status : Arc<Mutex<NodeStatus>>,    // a node status showing its role 
-    poisoned : Arc<AtomicBool>,               // a mechanism to help a follower kill itself
+    raft: Arc<Mutex<Raft>>,                       // raft state machine
+    node_status : Arc<Mutex<NodeStatus>>,         // a node status showing its role 
+    poison : (Arc<AtomicBool>,Arc<AtomicI32>),    // a mechanism to help a follower kill itself
+    tx : Sender<NodeStatus>,
+    mail_box : Receiver<NodeStatus>,
 }
 
 // no-interrupt event loop
@@ -296,10 +300,42 @@ impl Node {
     /// tick and following become_* function should return immediately
     #[inline]
     fn tick(&self,transmission : NodeStatus) {
-        match transmission {
-            NodeStatus::CANDIDATE => self.become_candidate(),
-            NodeStatus::LEADER => self.become_leader(),
-            NodeStatus::FOLLOWER => self.become_follower(),
+        let post = self.tx.clone();
+        post.try_send(transmission);
+    }
+
+    fn mail_daemon(&self) {
+        loop{
+            let msg = self.mail_box.poll();
+            match msg {
+                Ok(Async::NotReady) => {},
+                Err(_) => {break;},
+                Ok(Async::Ready(status)) => {
+                    match status {
+                        None => {panic!("Should Not Happen!");},
+                        Some(NodeStatus::CANDIDATE) => {thread::spawn(|| {self.become_candidate()});},
+                        Some(NodeStatus::LEADER) => {thread::spawn( || {self.become_leader()});},
+                        Some(NodeStatus::FOLLOWER) => {
+                            // try to use another channel, use an atomic as msg
+                            self.poison.0.store(true, Ordering::Relaxed);
+                            // spin itself
+                            // why there is no condition var? because here we are in MPSC
+                            // the SCP model makres sure here we handle the event sequently
+                            // and if we block the thread, then no further thread can move on
+                            loop{
+                                let (poisoned,semaphore) = self.poison;
+                                // if another thread has suicide itself, or the semaphore is positive,
+                                // which means it is still available
+                                if !poisoned.load(Ordering::Relaxed) || semaphore.load(Ordering::Relaxed) > 0 {break;}
+                            }
+                            self.poison.0.store(false, Ordering::Relaxed);
+                            self.poison.1.store(0, Ordering::Relaxed);
+                            thread::spawn(|| {self.become_follower()});
+                        },
+                        Some(NodeStatus::SUICIDE) => {break;},
+                    }
+                }
+            }
         }
     }
 
@@ -324,9 +360,10 @@ impl Node {
             // in this thread, so just exit in advance
             if *(self.node_status.lock().unwrap()) != NodeStatus::FOLLOWER {return;}
             // a new follower status is issued, so it needs to suicide itself and make thread have chance to suicide
-            if self.poisoned.load(Ordering::Relaxed) {
-                // reset the signal
-                self.poisoned.store(false, Ordering::Relaxed);
+            let (poisoned, semaphore) = self.poison;
+            if poisoned.load(Ordering::Relaxed) {
+                self.poison.0.store(false,Ordering::Relaxed);
+                self.poison.1.store(1,Ordering::Relaxed);
                 return;
             }
         });
@@ -551,8 +588,8 @@ impl RaftService for Node {
     to_do list:
     1. common react : when a higher term comes, convert itself
     2. for follower itself : even a normal vote/hearbeat rpc, it needs to issue a follower command
-    3. tick shall be a send(msg) async function
-    4. needs a routine looping to issue real node status -> mailbox
-    5. finish leader, notice when it gets response, it can change the leader status
-    6. refine leader and candidate, mute them properly, not lead to a crash
+    3. tick shall be a send(msg) async function x
+    4. needs a routine looping to issue real node status -> mailbox x
+    5. finish leader, notice when it gets response, it can change the leader status x
+    6. refine leader and candidate, mute them properly, not lead to a crash x
 */
