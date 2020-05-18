@@ -1,5 +1,5 @@
 //use std::sync::mpsc::{Sender, Receiver,channel};
-use std::sync::{Arc,Mutex};
+use std::sync::{Arc,Mutex, atomic::AtomicBool,atomic::Ordering};
 
 use futures::sync::mpsc::{UnboundedSender, channel, Sender, Receiver};
 use labrpc::RpcFuture;
@@ -179,7 +179,7 @@ impl Raft {
         // let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
         let peer = &self.peers[server];
         let peer_limit = self.peers.len();
-        let (tx, rx) : (Sender<Result<RequestVoteReply>>,Receiver<Result<RequestVoteReply>>) = channel(2 * peer_limit);
+        let (tx, rx) : (Sender<Result<RequestVoteReply>>,Receiver<Result<RequestVoteReply>>) = channel(peer_limit);
         peer.spawn(
             peer.request_vote(args)
                 .map_err(Error::Rpc)
@@ -190,15 +190,6 @@ impl Raft {
         );
         rx
     }
-    // function then
-    /*
-    Chain on a computation for when a future finished, passing the 
-    result of the future to the provided closure f.
-    The returned value of the closure must implement the Future trait and can 
-    represent some more work to be done before the composed future is finished.
-    The closure f is only run after successful completion of the self future.
-    Note that this function consumes the receiving future and returns a wrapped version of it.
-    */
 
     fn send_apply_entry(
         &self,
@@ -207,7 +198,7 @@ impl Raft {
     ) -> Receiver<Result<AppendEntriesReply>> {
         let peer = &self.peers[server];
         let peer_limit = self.peers.len();
-        let (tx, rx): (Sender<Result<AppendEntriesReply>>, Receiver<Result<AppendEntriesReply>>) = channel(2 * peer_limit);
+        let (tx, rx): (Sender<Result<AppendEntriesReply>>, Receiver<Result<AppendEntriesReply>>) = channel(peer_limit);
         peer.spawn(
             peer.append_entries(args)
                 .map_err(Error::Rpc)
@@ -253,7 +244,7 @@ impl Raft {
 }
 
 
-#[derive(Clone,Debug)]
+#[derive(Clone,Debug,PartialEq)]
 enum NodeStatus{
     LEADER,
     FOLLOWER,
@@ -276,12 +267,12 @@ enum NodeStatus{
 // ```
 #[derive(Clone)]
 pub struct Node {
-    // Your code here.
-    raft: Arc<Mutex<Raft>>,
-    status : Arc<Mutex<NodeStatus>>,
+    raft: Arc<Mutex<Raft>>,                  // raft state machine
+    node_status : Arc<Mutex<NodeStatus>>,    // a node status showing its role 
+    poisoned : Arc<AtomicBool>,               // a mechanism to help a follower kill itself
 }
 
-const SNAPTIME : u64 = 2;
+// no-interrupt event loop
 macro_rules! event_loop {
     ($duration : expr , $b : block) => {
         let before = Instant::now();
@@ -290,8 +281,6 @@ macro_rules! event_loop {
             if esclapsed > $duration {break;}
             // payload
             $b;
-            // reduce the frequency
-            thread::sleep(Duration::from_millis(SNAPTIME));
         }
     };
 }
@@ -326,29 +315,38 @@ impl Node {
         let new_state = Arc::new(State{term:self.term(),is_leader:false,voted_for:self.voted_for()});
         let mut raft_ptr = self.raft.lock().unwrap();
         (*raft_ptr).state = new_state;
-
-        // callback, in another thread
-        let _trigger_election = Delay::new(Self::random_duration_generator(100, 450)).map(|_|{
-            self.tick(NodeStatus::CANDIDATE); //issue a new candidate status
+        *(self.node_status.lock().unwrap()) = NodeStatus::FOLLOWER;
+        // event loop for checking the its clock,
+        // issue a election when timeout
+        let duration = Self::random_duration_generator(100, 450);
+        event_loop!(duration,{
+            // when the node status has change, there is no meaning to continue any work
+            // in this thread, so just exit in advance
+            if *(self.node_status.lock().unwrap()) != NodeStatus::FOLLOWER {return;}
+            // a new follower status is issued, so it needs to suicide itself and make thread have chance to suicide
+            if self.poisoned.load(Ordering::Relaxed) {
+                // reset the signal
+                self.poisoned.store(false, Ordering::Relaxed);
+                return;
+            }
         });
+        //issue a new candidate status
+        self.tick(NodeStatus::CANDIDATE); 
     } 
 
     fn become_candidate(&self)  {
         let mut raft_ptr = self.raft.lock().unwrap();
         // need to update the status of node!
         let myself_id = (*raft_ptr).me;
-        let new_state = Arc::new(State{term:self.term() + 1,is_leader:false,voted_for:myself_id as u64});
+        // buffer a term
+        let myself_term = self.term() + 1;
+        let new_state = Arc::new(State{term: myself_term, is_leader:false, voted_for:myself_id as u64});
         // update the state
         (*raft_ptr).state = new_state;
         // get the peer number, will be used later
         let peer_number = (*raft_ptr).peers.len();
         //  change interal status
-        *(self.status.lock().unwrap()) = NodeStatus::CANDIDATE;
-        let dur = Self::random_duration_generator(100, 450);
-        // reset election timer
-        let _trigger_election = Delay::new(dur).map(|_|{
-            self.tick(NodeStatus::CANDIDATE); //issue a new candidate status
-        });
+        *(self.node_status.lock().unwrap()) = NodeStatus::CANDIDATE;
         // async issue vote request
         let mut receivers_pool : Vec<Receiver<Result<RequestVoteReply>>> = 
                              Vec::with_capacity(peer_number);
@@ -364,26 +362,100 @@ impl Node {
         }
         // a counter to count how many votes itself gets
         let mut counter = 1;  // first we have the vote from ourselves.
+        // a flag used for exiting
+        let mut exit_flag = false;
+        // generate a leader election timeout
+        let dur = Self::random_duration_generator(100, 450);
+        // election process
+        // net IO blocking !
         event_loop!(dur, {
+            // try to fetch future result from sender side
             for rx in &mut receivers_pool {
                 // rx is the recevier of a future, poll is TRY TO fetch data
                 // from stream, it is never blocked.
                 if let Ok(Async::Ready(Some(Ok(vote_reply)))) = rx.poll(){
-                    if vote_reply.term == self.term() && vote_reply.vote_granted == true {
+                    if vote_reply.term == myself_term && vote_reply.vote_granted == true {
                         counter += 1;
+                    }
+                    if vote_reply.term > myself_term { 
+                        exit_flag = true; 
+                        // convert itself to follower
+                        self.tick(NodeStatus::FOLLOWER);
+                        break; 
                     }
                 }
             }
-            if counter >= (peer_number + 1)/2 {break;}
+            if *(self.node_status.lock().unwrap()) != NodeStatus::CANDIDATE {exit_flag = true;}
+            if counter >= (peer_number + 1)/2 {break;}  
+            if exit_flag {break;}
         });
+        // elegantly close the channel
+        for rx in &mut receivers_pool {
+            rx.close();
+        }
+        // interrupt in an early stage
+        if exit_flag {return;}
         if counter >= (peer_number + 1) / 2 {
             self.tick(NodeStatus::LEADER);
+        } else {
+            // otherwise issue new candidate
+            self.tick(NodeStatus::CANDIDATE);
         }
-        // otherwise just normally exit, because this time it must be another thread issueing new candidate
     }
 
     fn become_leader(&self) {
-        let  _ = 1;
+        let mut raft_ptr = self.raft.lock().unwrap();
+        // need to update the status of node!
+        let myself_id = (*raft_ptr).me;
+        let myself_term = self.term();
+        // change state to leader, leader won't vote
+        let new_state = Arc::new(State{term:myself_term, is_leader:true, voted_for:0});
+        // update the state
+        (*raft_ptr).state = new_state;
+        // get the peer number, will be used later
+        let peer_number = (*raft_ptr).peers.len();
+        //  change interal status
+        *(self.node_status.lock().unwrap()) = NodeStatus::LEADER;
+        
+        let append_timeout = Self::random_duration_generator(50, 100);
+        // run forver as server
+        loop{
+            let base_time = Instant::now();
+            // async issue vote request
+            let mut receivers_pool : Vec<Receiver<Result<AppendEntriesReply>>> = 
+            Vec::with_capacity(peer_number);
+            for index in 0..peer_number {
+                if index != myself_id {
+                    let server = index as usize;
+                    // 2A : a dummy append instruction
+                    let entries : [u8;20] = [0;20];
+                    let request_arg = AppendEntriesArgs{
+                    term           : self.term(),
+                    leader_id      : myself_id as u64,
+                    prev_log_index : 0,
+                    prev_log_term  : 0,
+                    leader_commit  : 0,
+                    entries        : entries.to_vec(),
+                    };
+                    receivers_pool.push((*raft_ptr).send_apply_entry(server,&request_arg));
+                }
+            }
+            // wait the reponse until timeout
+            let mut count = 1;
+            loop{
+                for rx in &mut receivers_pool {
+                    // rx is the recevier of a future, poll is TRY TO fetch data
+                    // from stream, it is never blocked.
+                    if let Ok(Async::Ready(Some(Ok(append_entries_reply)))) = rx.poll(){
+                        if append_entries_reply.term > myself_term {
+                            // exit !
+                            self.tick(NodeStatus::FOLLOWER);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Common part of all servers, no matter which state it is in
@@ -452,9 +524,9 @@ impl RaftService for Node {
         self.common_react();
 
         let vote_reply = if args.term < self.term(){
-                            RequestVoteReply{term:self.term(),vote_granted:false}
+                            RequestVoteReply{term : self.term(),vote_granted : false}
                         }else{
-                            RequestVoteReply{term:args.term,vote_granted:true}
+                            RequestVoteReply{term : args.term,vote_granted : true}
                         };
         Box::new(futures::future::result(Ok(vote_reply)))
     }
@@ -466,10 +538,21 @@ impl RaftService for Node {
         self.common_react();  //side effect!
 
         let append_reply =  if args.term < self.term(){
-                                AppendEntriesReply{term:self.term(), success : false}
+                                AppendEntriesReply{term : self.term(), success : false}
                             } else{
-                                AppendEntriesReply{term:args.term, success : true}
+                                AppendEntriesReply{term : args.term, success : true}
                             };
         Box::new(futures::future::result(Ok(append_reply)))
     }
 }
+
+
+/*
+    to_do list:
+    1. common react : when a higher term comes, convert itself
+    2. for follower itself : even a normal vote/hearbeat rpc, it needs to issue a follower command
+    3. tick shall be a send(msg) async function
+    4. needs a routine looping to issue real node status -> mailbox
+    5. finish leader, notice when it gets response, it can change the leader status
+    6. refine leader and candidate, mute them properly, not lead to a crash
+*/
